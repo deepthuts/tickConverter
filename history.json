@@ -1,0 +1,18 @@
+[
+  {
+    "id": "c754ef76a4",
+    "status": "done",
+    "started_at": "2026-11-05T08:05:23Z",
+    "file": "116d6e99_EURUSD_ticks_2026-04-26_2026-10-23.csv",
+    "symbol": "EURUSD",
+    "mode": "overwrite",
+    "ticks": 7864557,
+    "candles": 370044,
+    "days_uploaded": 130,
+    "days_skipped": 0,
+    "first_day": "2026-04-27",
+    "last_day": "2026-10-23",
+    "seconds": 488.3,
+    "finished_at": "2026-11-05T08:13:31Z"
+  }
+]

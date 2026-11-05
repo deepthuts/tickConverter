@@ -8,12 +8,14 @@
   :root {
     --bg: #f6f7f9; --card: #ffffff; --text: #1b1f27; --muted: #6b7280;
     --line: #e3e6eb; --accent: #2563eb; --ok: #15803d; --bad: #b91c1c;
+    --warn: #b45309; --warnbg: #fff4e0;
     --okbg: #e8f6ec; --badbg: #fdeaea; --logbg: #0f172a; --logtext: #cbd5e1;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #0e1116; --card: #161b22; --text: #e6e9ee; --muted: #8b95a5;
       --line: #263041; --accent: #4f8cff; --ok: #4ade80; --bad: #f87171;
+      --warn: #fbbf24; --warnbg: #2a2110;
       --okbg: #12261a; --badbg: #2a1414; --logbg: #090c12; --logtext: #b6c2d4;
     }
   }
@@ -38,6 +40,8 @@
   button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid transparent; }
   .primary { background: var(--accent); color: #fff; padding: 10px 18px; font-weight: 600; }
   .primary:disabled { opacity: .5; cursor: not-allowed; }
+  .stop { background: transparent; border-color: var(--bad); color: var(--bad); padding: 10px 18px; font-weight: 600; margin-left: 8px; }
+  .stop:disabled { opacity: .5; cursor: not-allowed; }
   .ghost { background: transparent; border-color: var(--line); color: var(--muted); padding: 4px 10px; font-size: 13px; }
   .ghost:hover { color: var(--bad); border-color: var(--bad); }
   .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 10px 0; display: none; }
@@ -48,6 +52,7 @@
   #status.running { display: block; background: var(--bg); border: 1px solid var(--line); }
   #status.done { display: block; background: var(--okbg); color: var(--ok); }
   #status.failed { display: block; background: var(--badbg); color: var(--bad); }
+  #status.stopped { display: block; background: var(--warnbg); color: var(--warn); }
   #log { background: var(--logbg); color: var(--logtext); font: 12.5px/1.6 ui-monospace, Consolas, monospace;
     border-radius: 8px; padding: 10px 12px; height: 210px; overflow: auto; white-space: pre-wrap; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 12px; }
@@ -61,6 +66,7 @@
   .pill { padding: 2px 8px; border-radius: 99px; font-size: 12px; font-weight: 600; }
   .pill.done { background: var(--okbg); color: var(--ok); }
   .pill.failed { background: var(--badbg); color: var(--bad); }
+  .pill.stopped { background: var(--warnbg); color: var(--warn); }
   .empty { color: var(--muted); padding: 8px 0; }
   .err { color: var(--bad); font-size: 13px; margin-top: 8px; }
 </style>
@@ -68,22 +74,16 @@
 <body>
 <div class="wrap">
   <h1>Tick Converter</h1>
-  <p class="sub">Turn a tick CSV into 30 second candles and send them to R2.</p>
+  <p class="sub">Turn a tick CSV into 30 second candles and send them to R2. The symbol comes from the file.</p>
 
   <div class="card">
     <h2>New conversion</h2>
-    <div class="row">
-      <div>
-        <label for="symbol">Symbol</label>
-        <input type="text" id="symbol" value="EURUSD">
-      </div>
-      <div>
-        <label for="mode">If a day is already in R2</label>
-        <select id="mode">
-          <option value="overwrite">Overwrite it</option>
-          <option value="skip">Skip it</option>
-        </select>
-      </div>
+    <div style="margin-bottom:12px">
+      <label for="mode">If a day is already in R2</label>
+      <select id="mode">
+        <option value="overwrite">Overwrite it</option>
+        <option value="skip">Skip it</option>
+      </select>
     </div>
 
     <div class="drop" id="drop">
@@ -97,6 +97,7 @@
     </div>
 
     <button class="primary" id="go">Start</button>
+    <button class="stop" id="stop" style="display:none">Stop</button>
     <div class="bar" id="bar"><div></div></div>
     <div class="err" id="formError"></div>
   </div>
@@ -118,6 +119,8 @@
 const $ = id => document.getElementById(id);
 let chosenFile = null;
 let running = false;
+let xhrActive = null;
+let currentJob = null;
 
 // ---------- file picking ----------
 const drop = $('drop'), fileInput = $('file');
@@ -142,7 +145,6 @@ $('go').addEventListener('click', () => {
   if (!chosenFile && !pathVal) { $('formError').textContent = 'Choose a file or paste a file path.'; return; }
 
   const form = new FormData();
-  form.append('symbol', $('symbol').value);
   form.append('mode', $('mode').value);
   if (chosenFile) form.append('file', chosenFile); else form.append('path', pathVal);
 
@@ -153,6 +155,7 @@ $('go').addEventListener('click', () => {
   setStatus('running', chosenFile ? 'Uploading file...' : 'Starting...');
 
   const xhr = new XMLHttpRequest();
+  xhrActive = xhr;
   xhr.open('POST', '/api/run');
   const bar = $('bar'); bar.style.display = 'block'; bar.classList.remove('busy'); bar.firstElementChild.style.width = '0';
   xhr.upload.onprogress = e => {
@@ -160,13 +163,19 @@ $('go').addEventListener('click', () => {
   };
   xhr.upload.onload = () => { bar.firstElementChild.style.width = ''; bar.classList.add('busy'); };
   xhr.onload = () => {
+    xhrActive = null;
     let data = {};
     try { data = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status !== 200) { fail(data.error || 'The server refused the file.'); return; }
+    currentJob = data.id;
     setStatus('running', 'Working...');
     poll(data.id, 0);
   };
-  xhr.onerror = () => fail('Could not reach the server. Is app.py running?');
+  xhr.onerror = () => { xhrActive = null; fail('Could not reach the server. Is app.py running?'); };
+  xhr.onabort = () => {
+    xhrActive = null; setRunning(false); $('bar').style.display = 'none';
+    setStatus('stopped', 'Upload cancelled. Nothing was sent to R2.');
+  };
   xhr.send(form);
 });
 
@@ -184,6 +193,11 @@ async function poll(id, since) {
     const j = await r.json();
     j.log.forEach(l => addLog(l));
     if (j.status === 'done') { finish(j.result); return; }
+    if (j.status === 'stopped') {
+      setRunning(false); $('bar').style.display = 'none';
+      setStatus('stopped', `Stopped. ${j.result.days_uploaded} day(s) were already sent to R2 and stay there.`);
+      showStats(j.result); loadHistory(); return;
+    }
     if (j.status === 'failed') {
       setRunning(false); $('bar').style.display = 'none';
       setStatus('failed', 'Failed: ' + j.error);
@@ -205,8 +219,14 @@ function addLog(l) {
 function finish(r) {
   setRunning(false);
   $('bar').style.display = 'none';
-  setStatus('done', `Done. ${r.days_uploaded} day(s) sent to R2 in ${r.seconds}s.`);
+  setStatus('done', `Done. ${r.days_uploaded} day(s) of ${r.symbol} sent to R2 in ${r.seconds}s.`);
+  showStats(r);
+  loadHistory();
+}
+
+function showStats(r) {
   const stats = [
+    ['Symbol', r.symbol || '-'],
     ['Ticks read', r.ticks.toLocaleString()],
     ['Candles made', r.candles.toLocaleString()],
     ['Days uploaded', r.days_uploaded],
@@ -215,11 +235,23 @@ function finish(r) {
     ['Last day', r.last_day || '-'],
   ];
   $('stats').innerHTML = stats.map(s => `<div class="stat"><b>${s[1]}</b><span>${s[0]}</span></div>`).join('');
-  loadHistory();
 }
 
 function setStatus(kind, text) { const s = $('status'); s.className = kind; s.textContent = text; }
-function setRunning(v) { running = v; $('go').disabled = v; $('go').textContent = v ? 'Running...' : 'Start'; }
+function setRunning(v) {
+  running = v; $('go').disabled = v; $('go').textContent = v ? 'Running...' : 'Start';
+  $('stop').style.display = v ? 'inline-block' : 'none'; $('stop').disabled = false;
+  if (!v) { xhrActive = null; currentJob = null; }
+}
+
+$('stop').addEventListener('click', async () => {
+  if (xhrActive) { xhrActive.abort(); return; }          // still uploading the file
+  if (currentJob) {
+    $('stop').disabled = true;
+    setStatus('running', 'Stopping... finishing the current step');
+    await fetch(`/api/jobs/${currentJob}/stop`, { method: 'POST' });
+  }
+});
 
 // ---------- history ----------
 async function loadHistory() {
@@ -232,10 +264,10 @@ async function loadHistory() {
       items.map(h => `<tr>
         <td>${h.finished_at ? new Date(h.finished_at).toLocaleString() : ''}</td>
         <td title="${esc(h.error || '')}">${esc(h.file)}</td>
-        <td>${esc(h.symbol)}</td>
+        <td>${esc(h.symbol) || '-'}</td>
         <td><span class="pill ${h.status}">${h.status}</span></td>
-        <td>${h.status === 'done' ? h.days_uploaded + (h.days_skipped ? ` (+${h.days_skipped} skipped)` : '') : '-'}</td>
-        <td>${h.status === 'done' ? h.candles.toLocaleString() : '-'}</td>
+        <td>${h.status !== 'failed' ? h.days_uploaded + (h.days_skipped ? ` (+${h.days_skipped} skipped)` : '') : '-'}</td>
+        <td>${h.status !== 'failed' ? h.candles.toLocaleString() : '-'}</td>
         <td>${h.first_day ? esc(h.first_day) + ' to ' + esc(h.last_day) : '-'}</td>
         <td><button class="ghost" onclick="removeItem('${h.id}')">Remove</button></td></tr>`).join('') +
       '</tbody></table>';

@@ -1,4 +1,4 @@
-import os, json, uuid, threading, traceback
+import os, json, uuid, shutil, tempfile, threading, traceback
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
@@ -6,9 +6,7 @@ from werkzeug.utils import secure_filename
 import ticks_to_r2
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-UPLOADS = os.path.join(BASE, 'uploads')
 HISTORY_FILE = os.path.join(BASE, 'history.json')
-os.makedirs(UPLOADS, exist_ok=True)
 
 app = Flask(__name__)
 
@@ -43,33 +41,42 @@ def delete_history(entry_id):
             json.dump(items, f, indent=2)
 
 # ---------- the job ----------
-def run_job(job, path, symbol, mode, delete_after):
+def run_job(job, path, mode, cleanup_dir):
     def progress(msg):
         job['log'].append({'time': now(), 'message': msg})
 
+    name = os.path.basename(path)
     with run_lock:
-        job['status'] = 'running'
         try:
-            result = ticks_to_r2.process_file(path, symbol, mode, progress)
+            if job['stop'].is_set():
+                raise ticks_to_r2.Stopped({'file': name, 'symbol': None, 'mode': mode,
+                    'ticks': 0, 'candles': 0, 'days_uploaded': 0, 'days_skipped': 0,
+                    'first_day': None, 'last_day': None, 'seconds': 0, 'finished_at': now()})
+            job['status'] = 'running'
+            result = ticks_to_r2.process_file(path, mode, progress, job['stop'].is_set)
             job['status'] = 'done'
             job['result'] = result
             add_history({'id': job['id'], 'status': 'done',
                          'started_at': job['started_at'], **result})
+        except ticks_to_r2.Stopped as e:
+            partial = e.args[0]
+            progress(f"Stopped. {partial['days_uploaded']} day(s) were already sent to R2 and stay there.")
+            job['status'] = 'stopped'
+            job['result'] = partial
+            add_history({'id': job['id'], 'status': 'stopped',
+                         'started_at': job['started_at'], **partial})
         except Exception as e:
             traceback.print_exc()
             job['status'] = 'failed'
             job['error'] = str(e)
             progress(f'Failed: {e}')
             add_history({'id': job['id'], 'status': 'failed',
-                         'started_at': job['started_at'],
-                         'file': os.path.basename(path), 'symbol': symbol,
-                         'mode': mode, 'error': str(e), 'finished_at': now()})
+                         'started_at': job['started_at'], 'file': name,
+                         'symbol': None, 'mode': mode, 'error': str(e),
+                         'finished_at': now()})
         finally:
-            if delete_after and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            if cleanup_dir:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 # ---------- routes ----------
 @app.route('/')
@@ -78,38 +85,43 @@ def index():
 
 @app.route('/api/run', methods=['POST'])
 def start_run():
-    symbol = (request.form.get('symbol') or ticks_to_r2.DEFAULT_SYMBOL).strip().upper()
     mode = request.form.get('mode') or ticks_to_r2.DEFAULT_MODE
-    if not symbol.isalnum():
-        return jsonify(error='Symbol can only have letters and numbers.'), 400
     if mode not in ('overwrite', 'skip'):
         return jsonify(error='Mode must be overwrite or skip.'), 400
 
+    job_id = uuid.uuid4().hex[:10]
     upload = request.files.get('file')
     pasted = (request.form.get('path') or '').strip().strip('"')
+    cleanup_dir = None
 
     if upload and upload.filename:
-        name = secure_filename(upload.filename)
-        path = os.path.join(UPLOADS, f'{uuid.uuid4().hex[:8]}_{name}')
-        upload.save(path)
-        delete_after = True        # remove the big copy when done
+        # save to a temporary folder, removed when the run ends.
+        # The original file name stays, because the symbol can come from it.
+        cleanup_dir = tempfile.mkdtemp(prefix='tickconv_')
+        path = os.path.join(cleanup_dir, secure_filename(upload.filename))
+        try:
+            upload.save(path)
+        except Exception:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+            return jsonify(error='The upload was cancelled or failed.'), 400
     elif pasted:
         if not os.path.isfile(pasted):
             return jsonify(error=f'File not found: {pasted}'), 400
-        path = pasted
-        delete_after = False       # never delete a file the user pointed to
+        path = pasted              # never deleted, since the user pointed to it
     else:
         return jsonify(error='Choose a file or paste a file path.'), 400
 
     if not path.lower().endswith('.csv'):
+        if cleanup_dir:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
         return jsonify(error='Only .csv tick files are supported.'), 400
 
-    job = {'id': uuid.uuid4().hex[:10], 'status': 'queued', 'log': [],
+    job = {'id': job_id, 'status': 'queued', 'log': [], 'stop': threading.Event(),
            'started_at': now(), 'result': None, 'error': None}
-    jobs[job['id']] = job
-    threading.Thread(target=run_job, args=(job, path, symbol, mode, delete_after),
+    jobs[job_id] = job
+    threading.Thread(target=run_job, args=(job, path, mode, cleanup_dir),
                      daemon=True).start()
-    return jsonify(id=job['id'])
+    return jsonify(id=job_id)
 
 @app.route('/api/jobs/<job_id>')
 def job_status(job_id):
@@ -119,6 +131,16 @@ def job_status(job_id):
     since = int(request.args.get('since', 0))
     return jsonify(status=job['status'], log=job['log'][since:],
                    next=len(job['log']), result=job['result'], error=job['error'])
+
+@app.route('/api/jobs/<job_id>/stop', methods=['POST'])
+def stop_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify(error='Unknown job.'), 404
+    if job['status'] in ('queued', 'running'):
+        job['stop'].set()
+        job['log'].append({'time': now(), 'message': 'Stop requested. Finishing the current step...'})
+    return jsonify(ok=True)
 
 @app.route('/api/history')
 def history():

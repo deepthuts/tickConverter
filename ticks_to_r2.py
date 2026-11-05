@@ -1,4 +1,4 @@
-import os, sys, json, time
+import os, sys, re, json, time
 import pandas as pd
 import boto3
 from datetime import datetime, timezone
@@ -12,13 +12,15 @@ except ImportError:
 
 # ---------- settings (read from .env) ----------
 BUCKET = os.environ.get('R2_BUCKET', 'your-bucket-name')
-OUT_ROOT = os.environ.get('OUT_ROOT', 'candles_30s')   # local copies of the daily JSON files
-DEFAULT_SYMBOL = os.environ.get('SYMBOL', 'EURUSD')
 DEFAULT_MODE = os.environ.get('MODE', 'overwrite')     # 'overwrite' or 'skip'
 CHUNK_ROWS = 2_000_000
+SYMBOL_COLS = ('symbol', 'instrument', 'pair', 'ticker')
 # -----------------------------------------------
 
 _s3 = None
+
+class Stopped(Exception):
+    """Raised when the user presses Stop. args[0] holds a summary of the work done so far."""
 
 def get_s3():
     global _s3
@@ -38,11 +40,27 @@ def exists_in_r2(key):
             return False
         raise
 
-def build_candles(path, progress=print):
-    parts = []
-    total_ticks = 0
+def clean_symbol(value):
+    return re.sub(r'[^A-Za-z0-9]', '', str(value)).upper()
+
+def symbol_from_filename(path):
+    name = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r'[A-Za-z0-9]{3,}', name)
+    return clean_symbol(m.group(0)) if m else None
+
+def build_candles(path, progress=print, should_stop=lambda: False):
+    parts, symbols, total_ticks = [], set(), 0
     for i, ch in enumerate(pd.read_csv(path, chunksize=CHUNK_ROWS), start=1):
+        if should_stop():
+            raise Stopped()
         ch.columns = [c.strip().lower() for c in ch.columns]
+
+        # look for a symbol column in the CSV
+        for col in SYMBOL_COLS:
+            if col in ch.columns:
+                symbols.update(s for s in (clean_symbol(v) for v in ch[col].dropna().unique()) if s)
+                break
+
         ch['time'] = pd.to_datetime(ch['time'], utc=True)
         ch['bid'] = pd.to_numeric(ch['bid'], errors='coerce')
         ch['ask'] = pd.to_numeric(ch['ask'], errors='coerce')
@@ -65,21 +83,19 @@ def build_candles(path, progress=print):
         volume=('volume', 'sum'), spr_sum=('spr_sum', 'sum'))
     df = df[df['volume'] > 0]
     df['spread'] = df['spr_sum'] / df['volume']   # average spread
-    return df.drop(columns='spr_sum'), total_ticks
+    return df.drop(columns='spr_sum'), total_ticks, symbols
 
-def save_days(df, symbol, mode, progress=print):
-    out_dir = os.path.join(OUT_ROOT, symbol)
-    os.makedirs(out_dir, exist_ok=True)
-
-    days_done, days_skipped, candles = [], [], 0
+def save_days(df, symbol, mode, progress, should_stop, stats):
     groups = list(df.groupby(df.index.date))
 
     for n, (day, d) in enumerate(groups, start=1):
+        if should_stop():
+            raise Stopped()
         day = str(day)
         key = f'ohlc/30s/{symbol}/{day}.json'
 
         if mode == 'skip' and exists_in_r2(key):
-            days_skipped.append(day)
+            stats['skipped'].append(day)
             progress(f'Skipped {day} (already in R2)  [{n}/{len(groups)}]')
             continue
 
@@ -100,53 +116,66 @@ def save_days(df, symbol, mode, progress=print):
         }
         body = json.dumps(payload, separators=(',', ':'))
 
-        with open(os.path.join(out_dir, f'{day}.json'), 'w') as f:
-            f.write(body)
-
         get_s3().put_object(
             Bucket=BUCKET, Key=key,
             Body=body.encode(), ContentType='application/json',
             CacheControl='public, max-age=3600')
 
-        days_done.append(day)
-        candles += len(rows)
+        stats['done'].append(day)
+        stats['candles'] += len(rows)
         progress(f'Uploaded {day}: {len(rows):,} candles  [{n}/{len(groups)}]')
 
-    return days_done, days_skipped, candles
-
-def process_file(path, symbol=None, mode=None, progress=print):
-    """Turn one tick CSV into daily 30s candle files and send them to R2.
-    Returns a summary dict. Raises an error if something fails."""
-    symbol = (symbol or DEFAULT_SYMBOL).upper()
-    mode = mode or DEFAULT_MODE
-    started = time.time()
-    progress(f'Starting {os.path.basename(path)} ({symbol}, mode: {mode})')
-
-    df, total_ticks = build_candles(path, progress)
-    progress(f'Built {len(df):,} candles. Sending days to R2')
-    days_done, days_skipped, candles = save_days(df, symbol, mode, progress)
-
-    seconds = round(time.time() - started, 1)
-    progress(f'Finished in {seconds}s')
+def _summary(path, ctx, mode, stats, started):
+    done = stats['done']
     return {
         'file': os.path.basename(path),
-        'symbol': symbol,
+        'symbol': ctx['symbol'],
         'mode': mode,
-        'ticks': total_ticks,
-        'candles': candles,
-        'days_uploaded': len(days_done),
-        'days_skipped': len(days_skipped),
-        'first_day': days_done[0] if days_done else None,
-        'last_day': days_done[-1] if days_done else None,
-        'seconds': seconds,
+        'ticks': ctx['ticks'],
+        'candles': stats['candles'],
+        'days_uploaded': len(done),
+        'days_skipped': len(stats['skipped']),
+        'first_day': done[0] if done else None,
+        'last_day': done[-1] if done else None,
+        'seconds': round(time.time() - started, 1),
         'finished_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
 
+def process_file(path, mode=None, progress=print, should_stop=lambda: False):
+    """Turn one tick CSV into daily 30s candle files and send them to R2.
+    The symbol comes from the CSV. Returns a summary dict.
+    Raises Stopped if the user pressed Stop, and another error if something fails."""
+    mode = mode or DEFAULT_MODE
+    started = time.time()
+    stats = {'done': [], 'skipped': [], 'candles': 0}
+    ctx = {'symbol': None, 'ticks': 0}
+    try:
+        progress(f'Starting {os.path.basename(path)} (mode: {mode})')
+        df, ctx['ticks'], symbols = build_candles(path, progress, should_stop)
+
+        # work out the symbol before anything goes to R2
+        if len(symbols) > 1:
+            raise ValueError('This file holds more than one symbol (' + ', '.join(sorted(symbols)) +
+                             '). Split it so each file has one symbol.')
+        if symbols:
+            ctx['symbol'], source = next(iter(symbols)), 'the CSV symbol column'
+        else:
+            ctx['symbol'], source = symbol_from_filename(path), 'the file name (no symbol column in the CSV)'
+        if not ctx['symbol']:
+            raise ValueError('Could not find a symbol. Add a symbol column to the CSV or start the file name with the symbol.')
+        progress(f"Symbol: {ctx['symbol']} (from {source})")
+
+        progress(f'Built {len(df):,} candles. Sending days to R2')
+        save_days(df, ctx['symbol'], mode, progress, should_stop, stats)
+        progress(f'Finished in {round(time.time() - started, 1)}s')
+    except Stopped:
+        raise Stopped(_summary(path, ctx, mode, stats, started))
+    return _summary(path, ctx, mode, stats, started)
+
 # Run it straight from the terminal if you like:
-#   python ticks_to_r2.py C:\ticks\EURUSD_2025.csv EURUSD
+#   python ticks_to_r2.py C:\ticks\EURUSD_2025.csv
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('Usage: python ticks_to_r2.py <tick_file.csv> [SYMBOL]')
+        print('Usage: python ticks_to_r2.py <tick_file.csv>')
         sys.exit(1)
-    result = process_file(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(process_file(sys.argv[1]), indent=2))
