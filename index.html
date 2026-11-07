@@ -42,6 +42,7 @@
   .primary:disabled { opacity: .5; cursor: not-allowed; }
   .stop { background: transparent; border-color: var(--bad); color: var(--bad); padding: 10px 18px; font-weight: 600; margin-left: 8px; }
   .stop:disabled { opacity: .5; cursor: not-allowed; }
+  .pause { background: transparent; border-color: var(--accent); color: var(--accent); padding: 10px 18px; font-weight: 600; margin-left: 8px; }
   .ghost { background: transparent; border-color: var(--line); color: var(--muted); padding: 4px 10px; font-size: 13px; }
   .ghost:hover { color: var(--bad); border-color: var(--bad); }
   .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 10px 0; display: none; }
@@ -52,7 +53,7 @@
   #status.running { display: block; background: var(--bg); border: 1px solid var(--line); }
   #status.done { display: block; background: var(--okbg); color: var(--ok); }
   #status.failed { display: block; background: var(--badbg); color: var(--bad); }
-  #status.stopped { display: block; background: var(--warnbg); color: var(--warn); }
+  #status.stopped, #status.paused { display: block; background: var(--warnbg); color: var(--warn); }
   #log { background: var(--logbg); color: var(--logtext); font: 12.5px/1.6 ui-monospace, Consolas, monospace;
     border-radius: 8px; padding: 10px 12px; height: 210px; overflow: auto; white-space: pre-wrap; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 12px; }
@@ -97,6 +98,7 @@
     </div>
 
     <button class="primary" id="go">Start</button>
+    <button class="pause" id="pause" style="display:none">Pause</button>
     <button class="stop" id="stop" style="display:none">Stop</button>
     <div class="bar" id="bar"><div></div></div>
     <div class="err" id="formError"></div>
@@ -121,6 +123,8 @@ let chosenFile = null;
 let running = false;
 let xhrActive = null;
 let currentJob = null;
+let stopping = false;
+let pausing = false;
 
 // ---------- file picking ----------
 const drop = $('drop'), fileInput = $('file');
@@ -168,6 +172,7 @@ $('go').addEventListener('click', () => {
     try { data = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status !== 200) { fail(data.error || 'The server refused the file.'); return; }
     currentJob = data.id;
+    $('pause').style.display = 'inline-block';
     setStatus('running', 'Working...');
     poll(data.id, 0);
   };
@@ -192,6 +197,7 @@ async function poll(id, since) {
     const r = await fetch(`/api/jobs/${id}?since=${since}`);
     const j = await r.json();
     j.log.forEach(l => addLog(l));
+    syncPause(j);
     if (j.status === 'done') { finish(j.result); return; }
     if (j.status === 'stopped') {
       setRunning(false); $('bar').style.display = 'none';
@@ -238,7 +244,40 @@ function showStats(r) {
 }
 
 function setStatus(kind, text) { const s = $('status'); s.className = kind; s.textContent = text; }
+function syncPause(j) {
+  const pb = $('pause');
+  if (j.status === 'paused') {
+    pausing = false;
+    pb.textContent = 'Continue'; pb.style.display = 'inline-block';
+    setStatus('paused', j.pause_reason === 'connection'
+      ? 'Connection problem. Paused, and the tool will retry on its own. Press Continue to retry now.'
+      : 'Paused. Press Continue to carry on.');
+  } else if (j.status === 'running') {
+    pb.textContent = 'Pause'; pb.style.display = 'inline-block';
+    if (stopping) setStatus('running', 'Stopping... finishing the current step');
+    else if (pausing) setStatus('running', 'Pausing... finishing the current step');
+    else setStatus('running', 'Working...');
+  }
+}
+
+$('pause').addEventListener('click', async () => {
+  if (!currentJob) return;
+  const pb = $('pause');
+  if (pb.textContent === 'Continue') {
+    pausing = false;
+    pb.textContent = 'Pause';
+    setStatus('running', 'Continuing...');
+    await fetch(`/api/jobs/${currentJob}/resume`, { method: 'POST' });
+  } else {
+    pausing = true;
+    setStatus('running', 'Pausing... finishing the current step');
+    await fetch(`/api/jobs/${currentJob}/pause`, { method: 'POST' });
+  }
+});
+
 function setRunning(v) {
+  stopping = false; pausing = false;
+  if (!v) { $('pause').style.display = 'none'; $('pause').textContent = 'Pause'; }
   running = v; $('go').disabled = v; $('go').textContent = v ? 'Running...' : 'Start';
   $('stop').style.display = v ? 'inline-block' : 'none'; $('stop').disabled = false;
   if (!v) { xhrActive = null; currentJob = null; }
@@ -248,6 +287,7 @@ $('stop').addEventListener('click', async () => {
   if (xhrActive) { xhrActive.abort(); return; }          // still uploading the file
   if (currentJob) {
     $('stop').disabled = true;
+    stopping = true;
     setStatus('running', 'Stopping... finishing the current step');
     await fetch(`/api/jobs/${currentJob}/stop`, { method: 'POST' });
   }

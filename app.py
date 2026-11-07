@@ -41,19 +41,27 @@ def delete_history(entry_id):
             json.dump(items, f, indent=2)
 
 # ---------- the job ----------
+def set_state(job, state, reason=None):
+    job['status'] = state
+    job['pause_reason'] = reason
+    if state == 'paused' and reason == 'user':
+        job['log'].append({'time': now(), 'message': 'Paused. Press Continue to carry on.'})
+
 def run_job(job, path, mode, cleanup_dir):
+    ctl = job['ctl']
+
     def progress(msg):
         job['log'].append({'time': now(), 'message': msg})
 
     name = os.path.basename(path)
     with run_lock:
         try:
-            if job['stop'].is_set():
+            if ctl.stop_ev.is_set():
                 raise ticks_to_r2.Stopped({'file': name, 'symbol': None, 'mode': mode,
                     'ticks': 0, 'candles': 0, 'days_uploaded': 0, 'days_skipped': 0,
                     'first_day': None, 'last_day': None, 'seconds': 0, 'finished_at': now()})
             job['status'] = 'running'
-            result = ticks_to_r2.process_file(path, mode, progress, job['stop'].is_set)
+            result = ticks_to_r2.process_file(path, mode, progress, ctl)
             job['status'] = 'done'
             job['result'] = result
             add_history({'id': job['id'], 'status': 'done',
@@ -116,8 +124,9 @@ def start_run():
             shutil.rmtree(cleanup_dir, ignore_errors=True)
         return jsonify(error='Only .csv tick files are supported.'), 400
 
-    job = {'id': job_id, 'status': 'queued', 'log': [], 'stop': threading.Event(),
+    job = {'id': job_id, 'status': 'queued', 'pause_reason': None, 'log': [],
            'started_at': now(), 'result': None, 'error': None}
+    job['ctl'] = ticks_to_r2.Control(on_state=lambda state, reason=None: set_state(job, state, reason))
     jobs[job_id] = job
     threading.Thread(target=run_job, args=(job, path, mode, cleanup_dir),
                      daemon=True).start()
@@ -129,17 +138,38 @@ def job_status(job_id):
     if not job:
         return jsonify(error='Unknown job.'), 404
     since = int(request.args.get('since', 0))
-    return jsonify(status=job['status'], log=job['log'][since:],
-                   next=len(job['log']), result=job['result'], error=job['error'])
+    return jsonify(status=job['status'], pause_reason=job['pause_reason'],
+                   log=job['log'][since:], next=len(job['log']),
+                   result=job['result'], error=job['error'])
 
 @app.route('/api/jobs/<job_id>/stop', methods=['POST'])
 def stop_job(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify(error='Unknown job.'), 404
-    if job['status'] in ('queued', 'running'):
-        job['stop'].set()
+    if job['status'] in ('queued', 'running', 'paused'):
+        job['ctl'].stop()
         job['log'].append({'time': now(), 'message': 'Stop requested. Finishing the current step...'})
+    return jsonify(ok=True)
+
+@app.route('/api/jobs/<job_id>/pause', methods=['POST'])
+def pause_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify(error='Unknown job.'), 404
+    if job['status'] in ('queued', 'running'):
+        job['ctl'].pause()
+        job['log'].append({'time': now(), 'message': 'Pause requested. Pausing at the next safe step...'})
+    return jsonify(ok=True)
+
+@app.route('/api/jobs/<job_id>/resume', methods=['POST'])
+def resume_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify(error='Unknown job.'), 404
+    if job['status'] in ('queued', 'running', 'paused'):
+        job['ctl'].resume()
+        job['log'].append({'time': now(), 'message': 'Continuing.'})
     return jsonify(ok=True)
 
 @app.route('/api/history')
